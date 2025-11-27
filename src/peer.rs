@@ -113,7 +113,7 @@ impl PeerMap {
             )
         };
         if guid.is_empty() {
-            match self.db.insert_peer(&id, &uuid, &pk, &info_str).await {
+            match self.db.insert_peer(&id, uuid.as_ref(), pk.as_ref(), &info_str).await {
                 Err(err) => {
                     log::error!("db.insert_peer failed: {}", err);
                     return register_pk_response::Result::SERVER_ERROR;
@@ -123,7 +123,7 @@ impl PeerMap {
                 }
             }
         } else {
-            if let Err(err) = self.db.update_pk(&guid, &id, &pk, &info_str).await {
+            if let Err(err) = self.db.update_pk(&guid, &id, pk.as_ref(), &info_str).await {
                 log::error!("db.update_pk failed: {}", err);
                 return register_pk_response::Result::SERVER_ERROR;
             }
@@ -177,4 +177,52 @@ impl PeerMap {
     pub(crate) async fn is_in_memory(&self, id: &str) -> bool {
         self.map.read().await.contains_key(id)
     }
+
+    /// Меняет ID пира: обновляет запись в БД и ключ в in-memory HashMap.
+    pub(crate) async fn change_id(
+        &self,
+        old_id: String,
+        new_id: String,
+        _uuid: Bytes,
+    ) -> ResultType<()> {
+        // 1. Берём peer по старому ID (из памяти или из БД)
+        let peer_lock = match self.get(&old_id).await {
+            Some(p) => p,
+            None => {
+                log::warn!("change_id: old_id {} not found", old_id);
+                return Ok(()); // до сюда в норме не должны доходить
+            }
+        };
+
+        // 2. Читаем guid/uuid/pk/info для обновления БД
+        let (guid, uuid, pk, info_str) = {
+            let p = peer_lock.read().await;
+            let info_str = serde_json::to_string(&p.info).unwrap_or_default();
+            (p.guid.clone(), p.uuid.clone(), p.pk.clone(), info_str)
+        };
+
+        // 3. Обновляем БД
+        if guid.is_empty() {
+            // Пир ещё не был сохранён — вставляем новую строку с new_id
+            self.db
+                .insert_peer(&new_id, uuid.as_ref(), pk.as_ref(), &info_str)
+                .await?;
+        } else {
+            // Пир уже есть в БД — меняем у него id
+            self.db
+                .update_pk(&guid, &new_id, pk.as_ref(), &info_str)
+                .await?;
+        }
+
+        // 4. Обновляем ключ в in-memory карте
+        let mut map = self.map.write().await;
+        if let Some(peer) = map.remove(&old_id) {
+            map.insert(new_id, peer);
+        } else {
+            log::warn!("change_id: old_id {} disappeared from map", old_id);
+        }
+
+        Ok(())
+    }
 }
+
